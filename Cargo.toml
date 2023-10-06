@@ -10,3 +10,5 @@ tokio = { version = "1", features = ["full"] }
 mail-parser = "0.9.1"
 ip_network = "0.4.1"
 bayespam = "1.1.0"
+anyhow = "1.0.75"
+thiserror = "1.0.49"

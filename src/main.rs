@@ -1,5 +1,3 @@
-use std::{fs::{File, self}, io::Read};
-use mail_parser::{*, core::message};
 mod spam;
 use spam::SpamScanner;
 
@@ -22,6 +20,9 @@ use spam::SpamScanner;
 async fn main() {
     let email_path = "fixtures/spam.eml".to_string();
     let mut scanner = SpamScanner::new();
-    let result = scanner.scan(email_path).await;
-    println!("{}",result.is_spam)
+    let result = scanner.scan(&email_path).await;
+    match result {
+        Ok(_) => println!("Request processed."),
+        Err(e) => println!("SpanScanError:{:?}",e.to_string())
+    }
 }

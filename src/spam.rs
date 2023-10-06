@@ -1,8 +1,29 @@
-
-use bayespam::classifier::{self, Classifier};
-use mail_parser::{core::message, *};
-use std::{fs, sync::Arc, time::Duration};
+use anyhow::Result;
+use bayespam::classifier::Classifier;
+use mail_parser::*;
+use std::{
+    fmt::{self, Display, Formatter},
+    fs,
+    sync::Arc,
+    thread,
+    time::Duration,
+};
+use thiserror::Error;
 use tokio::sync::Mutex;
+
+#[derive(Error, Debug)]
+pub enum SpamScanError {
+    IoError(std::io::Error),
+    TokenBucketError(String),
+}
+impl Display for SpamScanError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            SpamScanError::IoError(e) => write!(f, "IO error:{}", e),
+            SpamScanError::TokenBucketError(e) => write!(f, "Token bucket Error:{}", e),
+        }
+    }
+}
 
 pub struct SpamScanner {
     token_bucket: Arc<Mutex<TokenBucket>>,
@@ -12,34 +33,35 @@ pub struct SpamScanner {
 impl SpamScanner {
     pub fn new() -> SpamScanner {
         SpamScanner {
-            token_bucket: Arc::new(Mutex::new(TokenBucket::new(5, Duration::from_secs(1)))),
+            token_bucket: Arc::new(Mutex::new(TokenBucket::new(5))),
             classifier: Arc::new(Mutex::new(Classifier::new())),
         }
     }
 
-    pub async fn scan(&mut self, source: String) -> ScanResult {
-        let token_bucket: Arc<Mutex<TokenBucket>> = Arc::clone(&self.token_bucket);
+    pub async fn scan(&mut self, source: &str) -> Result<ScanResult> {
+        let token_bucket = Arc::clone(&self.token_bucket);
         let classifier = Arc::clone(&self.classifier);
 
-        let handle = tokio::spawn(async move {
-            let mut bucket = token_bucket.lock().await;
-            let mut classifier = classifier.lock().await;
-            if bucket.get_token().await {
-                let email_content = fs::read_to_string(source).expect("Unable to read file");
-                let message = MessageParser::default()
-                    .parse(email_content.as_str())
-                    .unwrap();
-                let body = message.body_text(0).unwrap();
-                classifier.train_spam("Be duly informed that because of our Western Union transfer policy, your funds will be paid to you via our Western Union Daily Transfer limit of $4,600.00 USD. This means that you will Continuously receive a daily amount of $4,600.00 USD, and this amount Can be collected from any of our numerous Western Union outlets in your current location.");
-                classifier.identify(body.trim())
-            } else {
-                panic!("令牌不足，请求被限制");
-            }
-        });
+        let mut bucket = token_bucket.lock().await;
+        let mut classifier = classifier.lock().await;
+        bucket.get_token().await?;
 
-        return ScanResult {
-            is_spam: handle.await.unwrap(),
-        };
+        println!("{}线程正在执行任务", thread::current().name().unwrap());
+
+        thread::sleep(Duration::from_secs(2));
+
+        let email_content = fs::read_to_string(source).expect("Unable to read file");
+        let message = MessageParser::default()
+            .parse(email_content.as_str())
+            .unwrap();
+        let body = message.body_text(0).unwrap();
+        classifier.train_spam("Be duly informed that because of our Western Union transfer policy, your funds will be paid to you via our Western Union Daily Transfer limit of $4,600.00 USD. This means that you will Continuously receive a daily amount of $4,600.00 USD, and this amount Can be collected from any of our numerous Western Union outlets in your current location.");
+
+        bucket.release_token().await;
+
+        Ok(ScanResult {
+            is_spam: classifier.identify(body.trim()),
+        })
     }
 }
 
@@ -50,24 +72,25 @@ pub struct ScanResult {
 pub struct TokenBucket {
     tokens: usize,
     max_tokens: usize,
-    refill_interval: Duration,
 }
 
 impl TokenBucket {
-    fn new(max_tokens: usize, refill_interval: Duration) -> Self {
+    fn new(max_tokens: usize) -> Self {
         TokenBucket {
             tokens: max_tokens,
             max_tokens,
-            refill_interval,
         }
     }
 
-    async fn get_token(&mut self) -> bool {
+    async fn get_token(&mut self) -> Result<bool> {
         if self.tokens > 0 {
             self.tokens -= 1;
-            return true;
+            Ok(true)
         } else {
-            return false;
+            Err(SpamScanError::TokenBucketError(
+                "Request blocked due to rate limiting.".to_string(),
+            )
+            .into())
         }
     }
 
@@ -78,23 +101,24 @@ impl TokenBucket {
     }
 }
 
-async fn processed(token_bucket: Arc<Mutex<TokenBucket>>) {
-    let mut bucket = token_bucket.lock().await;
-    if bucket.get_token().await {
-        // 有足够的令牌，处理请求
-        println!("Request processed.");
-    } else {
-        // 令牌不足，请求被限制
-        println!("Request blocked due to rate limiting.");
-    }
-}
-
-
-#[test]
 #[tokio::test]
 async fn spam_scanner_test() {
-    let email_path = "fixtures/spam.eml".to_string();
-    let mut scanner = ::new();
+    let email_path = "fixtures/spam.eml";
+    let mut scanner = SpamScanner::new();
     let result = scanner.scan(email_path).await;
-    assert!(result.is_spam);
+    let scan_result = result.expect("Request blocked due to rate limiting.");
+    assert!(scan_result.is_spam);
+}
+
+#[tokio::test]
+async fn token_bucket_error_test() {
+    let email_path = "fixtures/spam.eml";
+    let mut scanner = SpamScanner::new();
+    for _ in 0..5 {
+        let result = scanner.scan(email_path).await;
+        assert!(result.is_ok());
+    }
+
+    let result = scanner.scan(email_path).await;
+    assert!(result.is_err())
 }
